@@ -262,6 +262,12 @@ export class AgentSession {
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
 
+	// Autonomous loop state
+	private _autoCycle = 0; // forced continuations (agent stopped without loop-exit tool)
+	private _autoRepromptQueue: string[] = [];
+	private _autoReprompting = false;
+	private _loopMode: string | undefined;
+
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
 	private _pendingBashMessages: BashExecutionMessage[] = [];
@@ -566,6 +572,34 @@ export class AgentSession {
 
 			this._resolveRetry();
 			await this._checkCompaction(msg);
+
+			// ── Autonomous loop safety net ─────────────────────────────────────
+			// If the agent stops without calling autonomous_continue/stop/set_mode
+			// and we're in a forced loop mode, queue an auto-reprompt so the loop
+			// never silently dies. The reprompt is dispatched after prompt() returns.
+			const loopModes = ["autonomous", "researcher", "plan", "autonomous_plan"];
+			if (
+				this._loopMode &&
+				loopModes.includes(this._loopMode) &&
+				msg.role === "assistant" &&
+				msg.stopReason !== "error" &&
+				msg.stopReason !== "aborted"
+			) {
+				const toolCalls = msg.content?.filter((c: any) => c.type === "toolCall") ?? [];
+				const usedContinue = toolCalls.some((tc: any) => tc.toolCall?.name === "autonomous_continue");
+				const usedStop = toolCalls.some((tc: any) => tc.toolCall?.name === "autonomous_stop");
+				const switchedMode = toolCalls.some((tc: any) => tc.toolCall?.name === "set_mode");
+
+				if (!usedContinue && !usedStop && !switchedMode) {
+					this._autoCycle++;
+					const loopPrompt =
+						`[AUTONOMOUS LOOP — Cycle ${this._autoCycle}]\n\n` +
+						`Your previous turn ended. You are in **${this._loopMode}** mode (forced loop). ` +
+						`Continue working. Check status, run tools, spawn agents, commit changes. ` +
+						`Do NOT output final text and stop — keep working until the task is done.\n`;
+					this._autoRepromptQueue.push(loopPrompt);
+				}
+			}
 		}
 	}
 
@@ -1063,6 +1097,19 @@ export class AgentSession {
 
 		await this.agent.prompt(messages);
 		await this.waitForRetry();
+
+		// ── Autonomous loop: retry any queued reprompts ─────────────────────────
+		if (this._autoRepromptQueue.length > 0 && !this._autoReprompting) {
+			this._autoReprompting = true;
+			try {
+				while (this._autoRepromptQueue.length > 0) {
+					const reprompt = this._autoRepromptQueue.shift()!;
+					await this.prompt(reprompt);
+				}
+			} finally {
+				this._autoReprompting = false;
+			}
+		}
 	}
 
 	/**
@@ -1570,6 +1617,17 @@ export class AgentSession {
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
 		this.agent.followUpMode = mode;
 		this.settingsManager.setFollowUpMode(mode);
+	}
+
+	/** Get/set forced loop mode (autonomous, researcher, plan, autonomous_plan) */
+	getLoopMode(): string | undefined {
+		return this._loopMode;
+	}
+	setLoopMode(mode: string | undefined): void {
+		if (mode && !["autonomous", "researcher", "plan", "autonomous_plan"].includes(mode)) return;
+		this._loopMode = mode;
+		this._autoCycle = 0;
+		this._autoRepromptQueue = [];
 	}
 
 	// =========================================================================
