@@ -86,6 +86,49 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		});
 	};
 
+	// ── Retry helpers for rate-limit / upstream errors ──────────────
+	const RETRYABLE =
+		/provider.?returned.?error|rate.?limit|429|too many requests|overloaded|503|502|upstream.?connect|timed? ?out/i;
+
+	const isRetryable = (msg: string) => RETRYABLE.test(msg);
+
+	const promptWithRetry = async (prompt: string, opts?: { images?: ImageContent[] }): Promise<boolean> => {
+		const maxAttempts = 4;
+		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+			try {
+				await session.prompt(prompt, opts);
+
+				// Check if the prompt ended with an error state
+				const state = session.state;
+				const last = state.messages[state.messages.length - 1];
+				if (last?.role === "assistant" && last.stopReason === "error") {
+					const errMsg = (last as AssistantMessage).errorMessage ?? "";
+					if (!isRetryable(errMsg) || attempt === maxAttempts) {
+						return false; // non-retryable error or exhausted retries
+					}
+					const delayMs = 2000 * 2 ** (attempt - 1);
+					console.error(
+						`[retry ${attempt}/${maxAttempts}] rate-limit/upstream error, waiting ${delayMs / 1000}s: ${errMsg.substring(0, 120)}`,
+					);
+					await new Promise((r) => setTimeout(r, delayMs));
+					continue;
+				}
+				return true;
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				if (!isRetryable(msg) || attempt === maxAttempts) {
+					throw err;
+				}
+				const delayMs = 2000 * 2 ** (attempt - 1);
+				console.error(
+					`[retry ${attempt}/${maxAttempts}] ${msg.substring(0, 120)} — retrying in ${delayMs / 1000}s`,
+				);
+				await new Promise((r) => setTimeout(r, delayMs));
+			}
+		}
+		return false;
+	};
+
 	try {
 		if (mode === "json") {
 			const header = session.sessionManager.getHeader();
@@ -97,11 +140,27 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		await rebindSession();
 
 		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
+			const ok = await promptWithRetry(initialMessage, { images: initialImages });
+			if (!ok) {
+				const state = session.state;
+				const last = state.messages[state.messages.length - 1];
+				if (last?.role === "assistant") {
+					console.error((last as AssistantMessage).errorMessage ?? "request failed");
+				}
+				return 1;
+			}
 		}
 
 		for (const message of messages) {
-			await session.prompt(message);
+			const ok = await promptWithRetry(message);
+			if (!ok) {
+				const state = session.state;
+				const last = state.messages[state.messages.length - 1];
+				if (last?.role === "assistant") {
+					console.error((last as AssistantMessage).errorMessage ?? "request failed");
+				}
+				return 1;
+			}
 		}
 
 		if (mode === "text") {
