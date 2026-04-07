@@ -1095,7 +1095,41 @@ export class AgentSession {
 			}
 		}
 
-		await this.agent.prompt(messages);
+		// Wrap LLM prompt with retry for provider errors (rate limits, upstream errors)
+		const RETRYABLE = /overloaded|provider.?returned.?error|rate.?(limit|increased)|too many requests|429|500|502|503|504|service.?unavailable|server.?error|internal.?error|network.?error|connection.?error|connection.?refused|other side closed|fetch failed|upstream.?connect|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay/i;
+		const MAX_RETRIES = 50;
+		let promptOk = false;
+		const retryStart = Date.now();
+		const MAX_RETRY_TIME_MS = 8 * 60 * 1000; // 8 min total budget
+		for (let attempt = 0; attempt <= MAX_RETRIES && !promptOk && (Date.now() - retryStart) < MAX_RETRY_TIME_MS; attempt++) {
+			try {
+				await this.agent.prompt(messages);
+				promptOk = true;
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				if (!RETRYABLE.test(msg)) {
+					throw err; // non-retryable error
+				}
+				if (attempt >= MAX_RETRIES) {
+					throw err; // exhausted
+				}
+				// Rate-limit errors get slower backoff (1.5^attempt, starting at 15s)
+				// Normal errors get standard backoff (2^attempt starting at 2s)
+				const isRateLimit = /rate|429|request rate|increased/i.test(msg);
+				const delayMs = isRateLimit
+					? Math.min(120_000, Math.round(15_000 * 1.5 ** attempt)) // 15s, 22s, 34s, 51s, 76s, 114s... cap 120s
+					: Math.min(30_000, this.settingsManager.getRetrySettings().baseDelayMs * 2 ** attempt); // 2s, 4s, 8s, 16s... cap 30s
+				this._emit({
+					type: "auto_retry_start",
+					attempt: attempt + 1,
+					maxAttempts: MAX_RETRIES,
+					delayMs,
+					errorMessage: msg,
+				});
+				await new Promise((r) => setTimeout(r, delayMs));
+			}
+		}
+
 		await this.waitForRetry();
 
 		// ── Autonomous loop: retry any queued reprompts ─────────────────────────

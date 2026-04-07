@@ -88,12 +88,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	// ── Retry helpers for rate-limit / upstream errors ──────────────
 	const RETRYABLE =
-		/provider.?returned.?error|rate.?limit|429|too many requests|overloaded|503|502|upstream.?connect|timed? ?out/i;
+		/provider.?returned.?error|rate.?(limit|increased)|429|too many requests|overloaded|503|502|upstream.?connect|timed? ?out/i;
 
 	const isRetryable = (msg: string) => RETRYABLE.test(msg);
 
 	const promptWithRetry = async (prompt: string, opts?: { images?: ImageContent[] }): Promise<boolean> => {
-		const maxAttempts = 4;
+		const maxAttempts = 50;
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			try {
 				await session.prompt(prompt, opts);
